@@ -1,0 +1,429 @@
+#!/usr/bin/env node
+
+/**
+ * Paperclip Claude-to-AGY Fallback ACP Wrapper
+ *
+ * Proxies ACP (Agent Client Protocol) communication between Paperclip and Claude.
+ * Seamlessly falls over to Antigravity CLI (`agy`) when Claude usage,
+ * monthly/session quota limit, or OAuth/authentication failure is reached.
+ */
+
+import { spawn } from 'node:child_process';
+import readline from 'node:readline';
+import fs from 'node:fs';
+import path from 'node:path';
+import os from 'node:os';
+
+const REAL_HOME = process.env.PAPERCLIP_REAL_HOME || os.homedir();
+const REAL_USER = process.env.PAPERCLIP_REAL_USER || os.userInfo().username;
+const AGY_BIN = process.env.PAPERCLIP_AGY_BIN || path.join(REAL_HOME, '.local', 'bin', 'agy');
+const STATE_FILE = process.env.PAPERCLIP_CLAUDE_STATE_FILE || path.join(REAL_HOME, '.paperclip', 'data', 'claude_quota_state.json');
+
+// Locate the real claude-agent-acp binary. If this wrapper is symlinked over `claude-agent-acp`
+// (see README), the original is expected next to it as `claude-agent-acp.real`.
+function resolveClaudeBin() {
+  if (process.env.PAPERCLIP_CLAUDE_BIN) return process.env.PAPERCLIP_CLAUDE_BIN;
+  let self = null;
+  try { self = fs.realpathSync(process.argv[1]); } catch {}
+  for (const dir of (process.env.PATH || '').split(path.delimiter)) {
+    for (const name of ['claude-agent-acp.real', 'claude-agent-acp']) {
+      const candidate = path.join(dir, name);
+      try {
+        if (fs.existsSync(candidate) && fs.realpathSync(candidate) !== self) return candidate;
+      } catch {}
+    }
+  }
+  return 'claude-agent-acp';
+}
+const CLAUDE_BIN = resolveClaudeBin();
+
+function isQuotaExhausted() {
+  try {
+    if (!fs.existsSync(STATE_FILE)) return false;
+    const raw = fs.readFileSync(STATE_FILE, 'utf8');
+    const data = JSON.parse(raw);
+    if (data.exhausted && typeof data.resetsAt === 'number') {
+      if (Date.now() < data.resetsAt) {
+        return true;
+      } else {
+        try { fs.unlinkSync(STATE_FILE); } catch {}
+        return false;
+      }
+    }
+  } catch (err) {}
+  return false;
+}
+
+// Claude is the priority: fallback is only a short cooldown, after which Claude is retried.
+const QUOTA_COOLDOWN_MS = Number(process.env.PAPERCLIP_CLAUDE_QUOTA_COOLDOWN_MS) || 15 * 60 * 1000;
+const AUTH_COOLDOWN_MS = Number(process.env.PAPERCLIP_CLAUDE_AUTH_COOLDOWN_MS) || 2 * 60 * 1000;
+
+function isAuthErrorText(text) {
+  if (!text || typeof text !== 'string') return false;
+  const lower = text.toLowerCase();
+  return (
+    lower.includes("failed to authenticate") ||
+    lower.includes("oauth access token has expired") ||
+    lower.includes("re-authenticate to continue") ||
+    lower.includes("authentication_error") ||
+    lower.includes("invalid_api_key") ||
+    lower.includes("terminal access failure") ||
+    /\b401\b/.test(lower)
+  );
+}
+
+function setQuotaExhausted(kind = 'quota') {
+  try {
+    fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true });
+    const ms = kind === 'auth' ? AUTH_COOLDOWN_MS : QUOTA_COOLDOWN_MS;
+    fs.writeFileSync(STATE_FILE, JSON.stringify({
+      exhausted: true,
+      kind,
+      markedAt: Date.now(),
+      resetsAt: Date.now() + ms
+    }, null, 2));
+  } catch (err) {}
+}
+
+function isFallbackErrorText(text) {
+  if (!text || typeof text !== 'string') return false;
+  const lower = text.toLowerCase();
+  return (
+    lower.includes("monthly spend limit") ||
+    lower.includes("terminal limit failure") ||
+    lower.includes("terminal access failure") ||
+    lower.includes("no available quota") ||
+    lower.includes("hit your org's monthly spend limit") ||
+    lower.includes("hit your session limit") ||
+    lower.includes("hit your weekly limit") ||
+    lower.includes("rate limit exceeded") ||
+    lower.includes("credit balance is too low") ||
+    lower.includes("failed to authenticate") ||
+    lower.includes("oauth access token has expired") ||
+    lower.includes("re-authenticate to continue") ||
+    lower.includes("authentication_error") ||
+    lower.includes("invalid_api_key") ||
+    (lower.includes("overagestatus") && lower.includes("rejected"))
+  );
+}
+
+function hasTerminalSessionFailure(parsed) {
+  const failure = parsed?.result?._meta?.jetbrains?.air?.sessionFailure;
+  if (failure && typeof failure === 'object' && failure.severity === 'error') {
+    return true;
+  }
+  return false;
+}
+
+function isAuthPromptText(text) {
+  if (!text || typeof text !== 'string') return false;
+  const lower = text.toLowerCase();
+  return (
+    lower.includes("authentication required") ||
+    lower.includes("please visit the url to log in") ||
+    lower.includes("paste the authorization code here") ||
+    lower.includes("waiting for authentication")
+  );
+}
+
+let currentSessionId = 'session-' + Date.now();
+let currentCwd = process.cwd();
+let lastPromptId = null;
+let lastPromptText = '';
+let claudeChild = null;
+let isFallenOver = isQuotaExhausted();
+
+const rl = readline.createInterface({
+  input: process.stdin,
+  output: process.stdout,
+  terminal: false
+});
+
+function sendToPaperclip(msg) {
+  process.stdout.write(JSON.stringify(msg) + '\n');
+}
+
+function sendChunk(text) {
+  sendToPaperclip({
+    jsonrpc: '2.0',
+    method: 'session/update',
+    params: {
+      sessionId: currentSessionId,
+      update: {
+        sessionUpdate: 'agent_message_chunk',
+        content: {
+          type: 'text',
+          text
+        }
+      }
+    }
+  });
+}
+
+function triggerFailoverToAgy(reasonText = '') {
+  isFallenOver = true;
+  setQuotaExhausted(isAuthErrorText(reasonText) ? 'auth' : 'quota');
+  process.stderr.write(`[claude-to-agy] failing over to agy: ${String(reasonText).slice(0, 1500)}\n`);
+  if (claudeChild) {
+    try { claudeChild.kill('SIGTERM'); } catch {}
+    claudeChild = null;
+  }
+  if (lastPromptId != null && lastPromptText) {
+    const reqId = lastPromptId;
+    const text = lastPromptText;
+    lastPromptId = null;
+    lastPromptText = '';
+    runAgyTurn(text, reqId);
+  }
+}
+
+function runAgyTurn(promptText, reqId, onDone) {
+  const agyArgs = [
+    '--dangerously-skip-permissions',
+    '--output-format',
+    'stream-json',
+    '--print',
+    promptText
+  ];
+
+  // Pin real user HOME and PATH so agy can find credentials in ~/.gemini
+  const agyEnv = {
+    ...process.env,
+    HOME: REAL_HOME,
+    USER: REAL_USER,
+    LOGNAME: REAL_USER,
+    PATH: `${REAL_HOME}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${process.env.PATH || ''}`
+  };
+
+  const agyProc = spawn(AGY_BIN, agyArgs, {
+    cwd: currentCwd,
+    env: agyEnv,
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
+
+  const agyRl = readline.createInterface({
+    input: agyProc.stdout,
+    terminal: false
+  });
+
+  agyRl.on('line', (line) => {
+    if (isAuthPromptText(line)) {
+      process.stderr.write(`[AGY Auth Notice Suppressed]: ${line}\n`);
+      return;
+    }
+
+    try {
+      const parsed = JSON.parse(line);
+      if (parsed.event === 'step_update' && parsed.step_update?.text_delta) {
+        sendChunk(parsed.step_update.text_delta);
+      }
+    } catch {
+      if (!isAuthPromptText(line)) {
+        sendChunk(line + '\n');
+      }
+    }
+  });
+
+  agyProc.stderr.on('data', (data) => {
+    const str = data.toString();
+    if (isAuthPromptText(str)) {
+      process.stderr.write(`[AGY Stderr Auth Notice Suppressed]: ${str}\n`);
+      return;
+    }
+    if (str.trim()) {
+      sendChunk(str);
+    }
+  });
+
+  agyProc.on('close', (code) => {
+    if (reqId != null) {
+      sendToPaperclip({
+        jsonrpc: '2.0',
+        id: reqId,
+        result: {
+          stopReason: 'end_turn',
+          _meta: {
+            fallbackProvider: 'antigravity-agy',
+            exitCode: code
+          }
+        }
+      });
+    }
+    if (onDone) onDone();
+  });
+}
+
+function startClaude() {
+  if (isFallenOver) return;
+
+  // Paperclip injects an isolated HOME/CLAUDE_CONFIG_DIR and a managed OAuth token that gets revoked.
+  // Use the user's real Claude login (same as `claude` in Terminal) instead.
+  const claudeEnv = { ...process.env, HOME: REAL_HOME, USER: REAL_USER, LOGNAME: REAL_USER };
+  for (const k of ['CLAUDE_CONFIG_DIR', 'CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_API_KEY', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME']) {
+    delete claudeEnv[k];
+  }
+  claudeChild = spawn(CLAUDE_BIN, [], {
+    env: claudeEnv,
+    cwd: currentCwd,
+    stdio: ['pipe', 'pipe', 'pipe']
+  });
+
+  const claudeRl = readline.createInterface({
+    input: claudeChild.stdout,
+    terminal: false
+  });
+
+  claudeRl.on('line', (line) => {
+    if (isFallenOver) return;
+
+    let parsed = null;
+    try { parsed = JSON.parse(line); } catch {}
+
+    if (!parsed) {
+      if (isFallbackErrorText(line)) { triggerFailoverToAgy(line); return; }
+    } else {
+      // Only short assistant chunks count (limit notices), not long normal output mentioning limits
+      const chunk = parsed.params?.update?.content?.text;
+      if (typeof chunk === 'string' && chunk.length < 400 && isFallbackErrorText(chunk)) {
+        triggerFailoverToAgy(chunk);
+        return;
+      }
+    }
+
+    try {
+      if (!parsed) throw 0;
+      if (parsed.result?.sessionId) {
+        currentSessionId = parsed.result.sessionId;
+      }
+      if (
+        hasTerminalSessionFailure(parsed) ||
+        (parsed.error && isFallbackErrorText(JSON.stringify(parsed.error))) ||
+        (lastPromptId != null && parsed.id === lastPromptId && parsed.error)
+      ) {
+        triggerFailoverToAgy(JSON.stringify(parsed.error || parsed.result?._meta || ''));
+        return;
+      }
+      if (lastPromptId != null && parsed.id === lastPromptId && parsed.result) {
+        lastPromptId = null;
+        lastPromptText = '';
+      }
+    } catch {}
+
+    process.stdout.write(line + '\n');
+  });
+
+  claudeChild.stderr.on('data', (chunk) => {
+    const errText = chunk.toString();
+    if (isFallbackErrorText(errText)) {
+      triggerFailoverToAgy(errText);
+      return;
+    }
+    process.stderr.write(chunk);
+  });
+
+  claudeChild.on('close', () => {
+    claudeChild = null;
+    if (!isFallenOver && lastPromptId != null && lastPromptText) {
+      triggerFailoverToAgy();
+    }
+  });
+}
+
+if (!isFallenOver) {
+  startClaude();
+}
+
+rl.on('line', (line) => {
+  if (!line.trim()) return;
+
+  let msg;
+  try {
+    msg = JSON.parse(line);
+  } catch {
+    return;
+  }
+
+  if (msg.params?.cwd) {
+    currentCwd = msg.params.cwd;
+  }
+  if (msg.params?.sessionId) {
+    currentSessionId = msg.params.sessionId;
+  }
+
+  if (isFallenOver) {
+    if (msg.method === 'initialize') {
+      sendToPaperclip({
+        jsonrpc: '2.0',
+        id: msg.id,
+        result: {
+          protocolVersion: 1,
+          agentCapabilities: {
+            promptCapabilities: { image: true, embeddedContext: true },
+            mcpCapabilities: { http: true, sse: true },
+            loadSession: true,
+            sessionCapabilities: { list: {}, resume: {} }
+          },
+          agentInfo: {
+            name: 'antigravity-agy-fallback',
+            title: 'Antigravity AGY Fallback',
+            version: '1.3.3'
+          },
+          authMethods: []
+        }
+      });
+      return;
+    }
+
+    if (msg.method === 'session/new' || msg.method === 'session/load' || msg.method === 'session/resume') {
+      if (msg.params?.cwd) currentCwd = msg.params.cwd;
+      currentSessionId = msg.params?.sessionId || ('agy-session-' + Date.now());
+      sendToPaperclip({
+        jsonrpc: '2.0',
+        id: msg.id,
+        result: {
+          sessionId: currentSessionId,
+          modes: {
+            currentModeId: 'auto',
+            availableModes: [{ id: 'auto', name: 'Auto' }]
+          }
+        }
+      });
+      return;
+    }
+
+    if (msg.method === 'session/prompt') {
+      const promptParts = msg.params?.prompt || [];
+      const text = promptParts
+        .filter(p => p.type === 'text')
+        .map(p => p.text)
+        .join('\n');
+
+      runAgyTurn(text || 'Continue task', msg.id);
+      return;
+    }
+
+    if (msg.id != null) {
+      sendToPaperclip({
+        jsonrpc: '2.0',
+        id: msg.id,
+        result: {}
+      });
+    }
+    return;
+  }
+
+  if (msg.method === 'session/prompt') {
+    lastPromptId = msg.id;
+    const promptParts = msg.params?.prompt || [];
+    lastPromptText = promptParts
+      .filter(p => p.type === 'text')
+      .map(p => p.text)
+      .join('\n');
+  }
+
+  if (claudeChild && claudeChild.stdin.writable) {
+    claudeChild.stdin.write(line + '\n');
+  } else {
+    triggerFailoverToAgy();
+  }
+});
